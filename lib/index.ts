@@ -1,6 +1,6 @@
 import uid2 = require("uid2");
 import msgpack = require("notepack.io");
-import { Adapter, BroadcastOptions, Room, SocketId } from "socket.io-adapter";
+import { Adapter, BroadcastOptions, Room } from "socket.io-adapter";
 
 const debug = require("debug")("socket.io-redis");
 
@@ -93,6 +93,10 @@ export function createAdapter(
   };
 }
 
+function sidOf(request) {
+  return request.opts.rooms.at(0);
+}
+
 export class RedisAdapter extends Adapter {
   public readonly uid;
   public readonly requestsTimeout: number;
@@ -102,10 +106,15 @@ export class RedisAdapter extends Adapter {
   private readonly channel: string;
   private readonly requestChannel: string;
   private readonly responseChannel: string;
+  private readonly specificRequestChannel: string;
   private readonly specificResponseChannel: string;
   private requests: Map<string, Request> = new Map();
   private ackRequests: Map<string, AckRequest> = new Map();
   private redisListeners: Map<string, Function> = new Map();
+
+  private subscribings = new Set<string>();
+  private sidsBy = new Map<string, Set<string>>();
+  private roomsBy = new Map<string, Set<string>>();
 
   /**
    * Adapter constructor.
@@ -135,6 +144,7 @@ export class RedisAdapter extends Adapter {
     this.channel = prefix + "#" + nsp.name + "#";
     this.requestChannel = prefix + "-request#" + this.nsp.name + "#";
     this.responseChannel = prefix + "-response#" + this.nsp.name + "#";
+    this.specificRequestChannel = this.requestChannel + this.uid + "#";
     this.specificResponseChannel = this.responseChannel + this.uid + "#";
 
     const isRedisV4 = typeof this.pubClient.pSubscribe === "function";
@@ -165,7 +175,6 @@ export class RedisAdapter extends Adapter {
       this.redisListeners.set("pmessageBuffer", this.onmessage.bind(this));
       this.redisListeners.set("messageBuffer", this.onrequest.bind(this));
 
-      this.subClient.psubscribe(this.channel + "*");
       this.subClient.on(
         "pmessageBuffer",
         this.redisListeners.get("pmessageBuffer")
@@ -174,7 +183,8 @@ export class RedisAdapter extends Adapter {
       this.subClient.subscribe([
         this.requestChannel,
         this.responseChannel,
-        this.specificResponseChannel,
+        this.specificRequestChannel,
+        this.specificResponseChannel
       ]);
       this.subClient.on(
         "messageBuffer",
@@ -244,9 +254,13 @@ export class RedisAdapter extends Adapter {
   private async onrequest(channel, msg) {
     channel = channel.toString();
 
-    if (channel.startsWith(this.responseChannel)) {
+    if (channel.startsWith(this.channel)) {
+      return this.onmessage(null, channel, msg);
+    }
+    else if (channel.startsWith(this.responseChannel)) {
       return this.onresponse(channel, msg);
-    } else if (!channel.startsWith(this.requestChannel)) {
+    }
+    else if (!channel.startsWith(this.specificRequestChannel) && !channel.startsWith(this.requestChannel)) {
       return debug("ignore different channel");
     }
 
@@ -299,6 +313,7 @@ export class RedisAdapter extends Adapter {
 
       case RequestType.REMOTE_JOIN:
         if (request.opts) {
+          this.postjoin(request);
           const opts = {
             rooms: new Set<Room>(request.opts.rooms),
             except: new Set<Room>(request.opts.except),
@@ -322,6 +337,7 @@ export class RedisAdapter extends Adapter {
 
       case RequestType.REMOTE_LEAVE:
         if (request.opts) {
+          this.postleave(request);
           const opts = {
             rooms: new Set<Room>(request.opts.rooms),
             except: new Set<Room>(request.opts.except),
@@ -345,6 +361,7 @@ export class RedisAdapter extends Adapter {
 
       case RequestType.REMOTE_DISCONNECT:
         if (request.opts) {
+          this.postdisconnect(request);
           const opts = {
             rooms: new Set<Room>(request.opts.rooms),
             except: new Set<Room>(request.opts.except),
@@ -469,6 +486,78 @@ export class RedisAdapter extends Adapter {
       default:
         debug("ignoring unknown request type: %s", request.type);
     }
+  }
+
+  private channelOf(room: string) {
+    return `${this.channel}${room}#`;
+  }
+
+  private postjoin(request) {
+    const sid = sidOf(request);
+    request.rooms.forEach(room => {
+      let rooms = this.roomsBy.get(sid);
+      if (rooms === undefined) {
+        this.roomsBy.set(sid, rooms = new Set());
+      }
+      rooms.add(room);
+      let sids = this.sidsBy.get(room);
+      if (sids === undefined) {
+        this.sids.set(room, sids = new Set());
+      }
+      sids.add(sid);
+      const channel = this.channelOf(room);
+      if (!this.subscribings.has(channel)) {
+        this.subClient.subscribe(channel);
+        this.subscribings.add(channel);
+      }
+    });
+  }
+
+  private postleave(request) {
+    const leaveFrom = (room: string) => {
+      const sids = this.sidsBy.get(room);
+      if (sids === undefined) {
+        return;
+      }
+      sids.delete(sid);
+      if (sids.size === 0) {
+        this.sidsBy.delete(room);
+        const channel = this.channelOf(room);
+        if (this.subscribings.has(channel)) {
+          this.subClient.unsubscribe(channel);
+          this.subscribings.delete(channel);
+        }
+      }
+    };
+
+    const sid = sidOf(request);
+    const rooms = this.roomsBy.get(sid);
+    if (rooms === undefined) {
+      return;
+    }
+    const socket = this.nsp.sockets.get(sid);
+    if (socket !== undefined) {
+      request.rooms.forEach(room => {
+        rooms.delete(room);
+        leaveFrom(room);
+      });
+    }
+    else {
+      rooms.forEach(room => {
+        leaveFrom(room);
+      });
+      this.roomsBy.delete(sid);
+    }
+  }
+
+  private postdisconnect(request) {
+    request.rooms.forEach(room => {
+      const channel = this.channelOf(room);
+      if (this.subscribings.has(channel)) {
+        this.subClient.unsubscribe(channel);
+        this.subscribings.delete(channel);
+      }
+    });
   }
 
   /**
@@ -787,10 +876,10 @@ export class RedisAdapter extends Adapter {
         rooms: [...opts.rooms],
         except: [...opts.except],
       },
-      rooms: [...rooms],
+      rooms: [...rooms]
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.pubClient.publish(this.specificRequestChannel, request);
   }
 
   public delSockets(opts: BroadcastOptions, rooms: Room[]) {
@@ -805,10 +894,10 @@ export class RedisAdapter extends Adapter {
         rooms: [...opts.rooms],
         except: [...opts.except],
       },
-      rooms: [...rooms],
+      rooms: [...rooms]
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.pubClient.publish(this.specificRequestChannel, request);
   }
 
   public disconnectSockets(opts: BroadcastOptions, close: boolean) {
@@ -826,7 +915,7 @@ export class RedisAdapter extends Adapter {
       close,
     });
 
-    this.pubClient.publish(this.requestChannel, request);
+    this.pubClient.publish(this.specificRequestChannel, request);
   }
 
   public serverSideEmit(packet: any[]): void {
@@ -964,7 +1053,9 @@ export class RedisAdapter extends Adapter {
         true
       );
     } else {
-      this.subClient.punsubscribe(this.channel + "*");
+      this.subscribings.forEach(channel => {
+        this.subClient.unsubscribe(channel);
+      });
       this.subClient.off(
         "pmessageBuffer",
         this.redisListeners.get("pmessageBuffer")
