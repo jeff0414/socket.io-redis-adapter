@@ -502,7 +502,7 @@ export class RedisAdapter extends Adapter {
       rooms.add(room);
       let sids = this.sidsBy.get(room);
       if (sids === undefined) {
-        this.sids.set(room, sids = new Set());
+        this.sidsBy.set(room, sids = new Set());
       }
       sids.add(sid);
       const channel = this.channelOf(room);
