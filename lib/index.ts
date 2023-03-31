@@ -514,7 +514,7 @@ export class RedisAdapter extends Adapter {
   }
 
   private postleave(request) {
-    const leaveFrom = (room: string) => {
+    const tryunsubscribe = (room: string) => {
       const sids = this.sidsBy.get(room);
       if (sids === undefined) {
         return;
@@ -539,12 +539,12 @@ export class RedisAdapter extends Adapter {
     if (socket !== undefined) {
       request.rooms.forEach(room => {
         rooms.delete(room);
-        leaveFrom(room);
+        tryunsubscribe(room);
       });
     }
     else {
       rooms.forEach(room => {
-        leaveFrom(room);
+        tryunsubscribe(room);
       });
       this.roomsBy.delete(sid);
     }
